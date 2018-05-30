@@ -180,7 +180,7 @@ local function create_hook(self, orig, obj, method, handler, hook_type)
     end
 
     if type(obj) == "string" then
-        if not _G[obj] then
+        if not rawget(_G, obj) then
             return
         end
         obj = _G[obj]
@@ -237,7 +237,7 @@ local function get_orig_function(self, obj, method)
         -- obj can be a string. We'll need to grab the actual object first.
         -- if we can't find object, we don't need to go any further.
         if type(obj) == "string" then
-            if not _G[obj] then return end
+            if not rawget(_G, obj) then return end
             obj = _G[obj]
         end
         if is_orig_hooked(obj, method) then

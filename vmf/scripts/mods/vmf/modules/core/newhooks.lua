@@ -4,19 +4,29 @@ local vmf = get_mod("VMF")
 -- ##### Locals and Variables #########################################################################################
 -- ####################################################################################################################
 
--- Constants for hook_type
+-- hook_id is a unique ID for all of the types of hooks to help distinguish them.
+-- hook_type helps defines which "chain" of execution they are part of.
 local HOOK_TYPES = {
+    hook = 1,
+    before = 1,
+    after = 2,
+    rawhook = 3,
+}
+local HOOK_IDS = {
     hook = 1,
     before = 2,
     after = 3,
     rawhook = 4,
 }
 
--- Upvalued constants to ease on table looksup when not needed
+-- Upvalued constants to ease on table lookups when not needed
 local HOOK_TYPE_NORMAL = HOOK_TYPES.hook
-local HOOK_TYPE_BEFORE = HOOK_TYPES.before
-local HOOK_TYPE_AFTER  = HOOK_TYPES.after
-local HOOK_TYPE_RAW = HOOK_TYPES.rawhook
+local HOOK_TYPE_AFTER  = HOOK_IDS.after
+local HOOK_TYPE_RAW = HOOK_IDS.rawhook
+local HOOK_ID_NORMAL = HOOK_IDS.hook
+local HOOK_ID_BEFORE = HOOK_IDS.before
+local HOOK_ID_AFTER  = HOOK_IDS.after
+local HOOK_ID_RAW = HOOK_IDS.rawhook
 
 --[[ Planned registry structure:
   _registry[self][hook_type] = {
@@ -37,9 +47,8 @@ local _registry = setmetatable({}, auto_table_meta)
 -- This table will hold all of the hooks, in the format of _registry.hooks[hook_type]
 _registry.hooks = {
     -- Do the same thing with these tables to allow .hooks[hook_type][orig] without a ton of nil-checks.
-    setmetatable({}, auto_table_meta), -- before
+    setmetatable({}, auto_table_meta), -- normal / before
     setmetatable({}, auto_table_meta), -- after
-    setmetatable({}, auto_table_meta), -- normal
     -- Since there can only be one rawhook per function, it doesnt need to generate a table.
     {}, -- raw
 }
@@ -50,7 +59,7 @@ _registry.origs = {}
 -- ####################################################################################################################
 
 -- New API will return an object containing these metamethods.
--- Note: It might be slightly troublesome to get the hook object of a delayed hook. Will research later.
+-- Note: It might be slightly troublesome to get the hook object of a delayed hook.
 local HookObject = {}
 function HookObject:enable()
     self._registry.active[self._orig] = true
@@ -160,15 +169,17 @@ local function get_hook_chain(orig)
 end
 
 -- Returns a function closure with all the information needed for a given hook to be handled correctly.
-local function create_specialized_hook(self, orig, handler, hook_type)
+local function create_specialized_hook(self, orig, handler, hook_type, hook_id)
     local func
     local active = _registry[self][hook_type].active
-    if hook_type == HOOK_TYPE_NORMAL then
-        -- Determine the previous function in the hook stack
-        local previous_hook = get_hook_chain(orig)
-        -- Note: If a previous hook is removed from the table, this function wouldnt be updated
-        -- This would break the chain, solution would be not to remove the hook, but make it inactive
-        -- Make sure inactive hooks just seamlessly call the next function on the list without disruption.
+
+    -- Determine the previous function in the hook stack
+    -- Note: If a previous hook is removed from the table, these functions wouldnt be updated
+    -- This would break the chain, solution is to not remove the hooks, simply make them inactive
+    -- Make sure inactive hooks that rely on the chain still call the next function seamlessly.
+    local previous_hook = get_hook_chain(orig)
+   
+    if hook_id == HOOK_ID_NORMAL then
         func = function(...)
             if active[orig] then
                 return handler(previous_hook, ...)
@@ -176,8 +187,8 @@ local function create_specialized_hook(self, orig, handler, hook_type)
                 return previous_hook(...)
             end
         end
-    -- Need to make sure a disabled Rawhook will correctly call the original.
-    elseif hook_type == HOOK_TYPE_RAW then
+    -- Rawhooks need to directly call the original function is inactive.
+    elseif hook_id == HOOK_ID_RAW then
         func = function(...)
             if active[orig] then
                 return handler(...)
@@ -185,12 +196,21 @@ local function create_specialized_hook(self, orig, handler, hook_type)
                 return orig(...)
             end
         end
-    else
+    elseif hook_id == HOOK_ID_BEFORE then
+        func = function(...)
+            if active[orig] then
+                handler(...)
+            end
+            return previous_hook(...)
+        end
+    elseif hook_id == HOOK_ID_AFTER then
         func = function(...)
             if active[orig] then
                 return handler(...)
             end
         end
+    else
+        self:error("(create_specialized_hook): Invalid hook_type given. You should never this see.")
     end
     return func
 end
@@ -199,25 +219,20 @@ end
 -- The hook system makes internal functions that replace the original function and handles all the hooks.
 local function create_internal_hook(orig, obj, method)
     local fn = function(...)
-        local before_hooks = _registry.hooks[HOOK_TYPE_BEFORE][orig]
-        local after_hooks = _registry.hooks[HOOK_TYPE_AFTER][orig]
-        if before_hooks and #before_hooks > 0 then
-            for i = 1, #before_hooks do before_hooks[i](...) end
-        end
         -- Execute the hook chain. Note that we need to keep the return values
         -- in case another function depends on them.
         local hook_chain = get_hook_chain(orig)
         -- We need to keep return values in case another function depends on them
         local values = { hook_chain(...) }
+        
+        local after_hooks = _registry.hooks[HOOK_TYPE_AFTER][orig]
         if after_hooks and #after_hooks > 0 then
             for i = 1, #after_hooks do after_hooks[i](...) end
         end
-        --print(#values)
         return unpack(values)
     end
 
     if obj then
-        -- object cannot be a string at this point, so we don't need to check for that.
         if not _registry.origs[obj] then _registry.origs[obj] = {} end
         _registry.origs[obj][method] = orig
         obj[method] = fn
@@ -227,7 +242,7 @@ local function create_internal_hook(orig, obj, method)
     end
 end
 
-local function create_hook(self, orig, obj, method, handler, func_name, hook_type)
+local function create_hook(self, orig, obj, method, handler, func_name, hook_type, hook_id)
 
     if not is_orig_hooked(obj, method) then
         create_internal_hook(orig, obj, method)
@@ -242,24 +257,28 @@ local function create_hook(self, orig, obj, method, handler, func_name, hook_typ
                 handler = {},
             }
         end
-        _registry[self][hook_type].active[orig] = true
-        _registry[self][hook_type].handler[orig] = handler
+
+        local registry = _registry[self][hook_type]
+        registry.active[orig] = true
+        registry.handler[orig] = handler
+
+        local hook_registry = _registry.hooks[hook_type]
         -- Add to the hook to registry. Raw hooks are unique, so we check for that too.
         if hook_type == HOOK_TYPE_RAW then
-            if _registry.hooks[hook_type][orig] then
+            if hook_registry[orig] then
                 self:error("(%s): Attempting to rawhook already hooked function %s", func_name, method)
             else
-                _registry.hooks[hook_type][orig] = create_specialized_hook(self, orig, handler, hook_type)
+                hook_registry[orig] = create_specialized_hook(self, orig, handler, hook_type, hook_id)
             end
         else
-            table.insert(_registry.hooks[hook_type][orig], create_specialized_hook(self, orig, handler, hook_type))
+            table.insert(hook_registry[orig], create_specialized_hook(self, orig, handler, hook_type, hook_id))
         end
     else
-        local hook_type_name = func_name
-        if hook_type == HOOK_TYPE_BEFORE or hook_type == HOOK_TYPE_AFTER then
-            hook_type_name = func_name.."-hook"
+        local hook_id_name = func_name
+        if hook_id == HOOK_ID_BEFORE or hook_id == HOOK_ID_AFTER then
+            hook_id_name = func_name.."-hook"
         end
-        self:error("(%s): Attempting to rehook already active %s.", func_name, hook_type_name, method)
+        self:error("(%s): Attempting to rehook already active %s.", func_name, hook_id_name, method)
         return
     end
 
@@ -295,6 +314,7 @@ local function generic_hook(self, obj, method, handler, func_name)
 
     -- Get hook_type based on name
     local hook_type = HOOK_TYPES[func_name]
+    local hook_id = HOOK_IDS[func_name]
 
     -- Check if hook should be delayed.
     local obj, sucess = get_object_from_string(obj) --luacheck: ignore
@@ -302,14 +322,14 @@ local function generic_hook(self, obj, method, handler, func_name)
         -- Call this func at a later time, using upvalues.
         vmf:info("(%s): [%s.%s] needs to be delayed.", func_name, obj, method)
         table.insert(_delayed, function()
-            generic_hook(self, obj, method, handler, hook_type)
+            generic_hook(self, obj, method, handler, func_name)
         end)
         return
     end
 
     -- obj can't be a string for these now.
     local orig = get_orig_function(self, obj, method)
-    return create_hook(self, orig, obj, method, handler, func_name, hook_type)
+    return create_hook(self, orig, obj, method, handler, func_name, hook_type, hook_id)
 end
 
 local function generic_hook_toggle(self, obj, method, func_name)
@@ -363,8 +383,6 @@ end
 -- :before() provides a callback before a function is called. You have no control over the execution of the
 --           original function, nor can you change its return values.
 -- This type of hook is typically used if you need to know a function was called, but dont want to modify it.
--- These will always be executed before the hook chain.
--- Due to discussion, handler may not receive any arguments, but will see what the use cases are with them first.
 function VMFMod:before(obj, method, handler)
     return generic_hook(self, obj, method, handler, "before")
 end
